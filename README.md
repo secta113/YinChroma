@@ -33,7 +33,7 @@ YINアルゴリズムを採用した高精度・低遅延ギターチューナ�
 
 以下のコマンドを実行して、必要なパッケージをインストールしてください。
 
-pip install \-r requirements.txt
+`pip install \-r requirements.txt`
 
 **主要な依存関係:**
 
@@ -44,8 +44,7 @@ pip install \-r requirements.txt
 
 ### **2\. 実行**
 
-python main.py
-
+`python main.py`
 
 ## **📖 使い方**
 
