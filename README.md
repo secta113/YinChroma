@@ -18,7 +18,7 @@ YINアルゴリズムを採用した高精度・低遅延ギターチューナ�
 ## **📁 プロジェクト構成**
 
 \#YinChroma/  
- ├ README.md            # 本ファイル  
+ ├ README.md            \# 本ファイル  
  ├ config.ini           \# 設定ファイル（振幅閾値など）  
  ├ main.py              \# メインエントリー（Flet UI）  
  ├ soundhandler.py      \# 音声再生管理 (pygame.mixer)  
