@@ -1,95 +1,76 @@
-# v1.4
+# v1.6
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
 マイク入力とピッチ検出（周波数分析）を管理するモジュール。
-v1.4: UIコールバックにセント値を渡す機能を追加しました。
+v1.6: チューニングセットの動的変更に対応しました。
 """
 
 import pyaudio
 import numpy as np
 import logging
 import math
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Dict
 
 class PitchDetector:
     RATE = 44100
     CHUNK = 2048 
     
-    # 7弦ギター対応: B1を追加
-    GUITAR_FREQUENCIES = {
-        "7弦 (B1)": 61.74,
-        "6弦 (E2)": 82.41,
-        "5弦 (A2)": 110.00,
-        "4弦 (D3)": 146.83,
-        "3弦 (G3)": 196.00,
-        "2弦 (B3)": 246.94,
-        "1弦 (E4)": 329.63,
-    }
-    
-    # B1(61.74Hz)を検知できるよう最小周波数を引き下げ
-    MIN_FREQ = 55.0
-    MAX_FREQ = 350.0
+    MIN_FREQ = 50.0 # より低いチューニングに対応するため少し拡張
+    MAX_FREQ = 400.0
     TOLERANCE_CENTS = 50 
     YIN_THRESHOLD = 0.15
 
     def __init__(self, 
-                 ui_callback: Callable[[str, float, Optional[float]], None], # (★v1.4修正: centsも受け取る定義に変更)
+                 ui_callback: Callable[[str, float, Optional[float]], None],
                  threshold: float = 20.5):
         self.pa: Optional[pyaudio.PyAudio] = None
         self.stream: Optional[pyaudio.Stream] = None
         self.ui_callback = ui_callback
+        
+        # 現在のターゲット周波数辞書
+        self.target_frequencies: Dict[str, float] = {}
         
         self.AMPLITUDE_THRESHOLD_RMS = threshold
         self._is_running = False 
 
         self.min_period = int(self.RATE / self.MAX_FREQ)
         self.max_period = int(self.RATE / self.MIN_FREQ)
-        self.yin_buffer_size = self.CHUNK * 2
-        self.yin_buffer = np.zeros(self.yin_buffer_size, dtype=np.float32)
+        self.yin_buffer = np.zeros(self.CHUNK * 2, dtype=np.float32)
         self.diff_buffer = np.zeros(self.max_period, dtype=np.float32)
         self.cmndf_buffer = np.zeros(self.max_period, dtype=np.float32)
         
-        logging.info(f"PitchDetector v1.4 (視覚化対応) 初期化。")
+        logging.info("PitchDetector v1.6 初期化完了。")
 
     def set_threshold(self, value: float):
         self.AMPLITUDE_THRESHOLD_RMS = value
-        logging.debug(f"検出閾値を変更しました: {value}")
+
+    def set_tuning_frequencies(self, frequencies: Dict[str, float]):
+        """検出対象の周波数セットを更新します。"""
+        self.target_frequencies = frequencies
+        logging.info(f"検出ターゲットを更新しました: {list(frequencies.keys())}")
 
     def start_stream(self):
-        if self.stream and self.stream.is_active():
-            logging.warning("ストリームは既に開始されています。")
-            return
-
+        if self.stream and self.stream.is_active(): return
         try:
             self.pa = pyaudio.PyAudio()
             self._is_running = True 
-            
             self.stream = self.pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.RATE,
-                input=True,
-                frames_per_buffer=self.yin_buffer_size, 
+                format=pyaudio.paInt16, channels=1, rate=self.RATE,
+                input=True, frames_per_buffer=self.CHUNK * 2, 
                 stream_callback=self._pyaudio_callback
             )
             self.stream.start_stream()
-            logging.info("マイク入力を開始しました。")
         except Exception as e:
             self._is_running = False 
             logging.error(f"ストリーム開始エラー: {e}")
             self.ui_callback("エラー: マイク不可", 0.0, None)
 
     def _pyaudio_callback(self, in_data, frame_count, time_info, status):
-        if not self._is_running:
-            return (None, pyaudio.paComplete) 
-
+        if not self._is_running: return (None, pyaudio.paComplete) 
         try:
             data = np.frombuffer(in_data, dtype=np.int16)
-            if data.size == 0:
-                return (in_data, pyaudio.paContinue) 
-
             amplitude = np.sqrt(np.mean(data.astype(np.float64)**2))
             normalized_volume = min(amplitude / 32768.0, 1.0)
 
@@ -99,12 +80,10 @@ class PitchDetector:
             else:
                 freq = self._find_fundamental_frequency_yin(data)
             
-            result_string, cents = self._match_frequency(freq, 1.0)
+            result_string, cents = self._match_frequency(freq)
             self.ui_callback(result_string, normalized_volume, cents)
-            
         except Exception as e:
-            logging.warning(f"コールバック内エラー: {e}")
-            
+            logging.warning(f"コールバックエラー: {e}")
         return (in_data, pyaudio.paContinue)
 
     def _find_fundamental_frequency_yin(self, data: np.ndarray) -> float:
@@ -117,66 +96,37 @@ class PitchDetector:
         running_sum = 0.0
         for tau in range(1, self.max_period):
             running_sum += self.diff_buffer[tau]
-            if running_sum == 0:
-                self.cmndf_buffer[tau] = 1.0
-            else:
-                self.cmndf_buffer[tau] = self.diff_buffer[tau] * tau / running_sum
+            self.cmndf_buffer[tau] = (self.diff_buffer[tau] * tau / running_sum) if running_sum != 0 else 1.0
+        
         tau = self.min_period
         while tau < self.max_period:
             if self.cmndf_buffer[tau] < self.YIN_THRESHOLD:
-                while tau + 1 < self.max_period and self.cmndf_buffer[tau + 1] < self.cmndf_buffer[tau]:
+                while tau + 1 < self.max_period and self.cmndf_buffer[tau+1] < self.cmndf_buffer[tau]:
                     tau += 1
                 period_offset = 0.0
-                if tau > 0 and tau < self.max_period - 1:
-                    y1 = self.cmndf_buffer[tau - 1]
-                    y2 = self.cmndf_buffer[tau]
-                    y3 = self.cmndf_buffer[tau + 1]
-                    denominator = y1 - (2 * y2) + y3
-                    if abs(denominator) > 1e-6:
-                        period_offset = 0.5 * (y1 - y3) / denominator
-                precise_period = tau + period_offset
-                return self.RATE / precise_period
+                if 0 < tau < self.max_period - 1:
+                    y1, y2, y3 = self.cmndf_buffer[tau-1:tau+2]
+                    denom = y1 - (2 * y2) + y3
+                    if abs(denom) > 1e-6: period_offset = 0.5 * (y1 - y3) / denom
+                return self.RATE / (tau + period_offset)
             tau += 1
         return 0.0
 
-    def _match_frequency(self, freq: float, amplitude: float) -> Tuple[str, Optional[float]]:
-        """
-        周波数を解析し、表示用テキストとセント値を返します。
-        """
-        if freq == 0.0:
-            return "---", None
-            
-        best_match_name = None
-        min_diff_cents = float('inf')
+    def _match_frequency(self, freq: float) -> Tuple[str, Optional[float]]:
+        if freq == 0.0: return "---", None
+        best_match_name, min_diff_cents = None, float('inf')
         
-        for string_name, base_freq in self.GUITAR_FREQUENCIES.items():
+        for name, base_freq in self.target_frequencies.items():
             diff_cents = 1200 * math.log2(freq / base_freq)
             if abs(diff_cents) < abs(min_diff_cents):
-                min_diff_cents = diff_cents
-                best_match_name = string_name
+                min_diff_cents, best_match_name = diff_cents, name
                 
         if abs(min_diff_cents) <= self.TOLERANCE_CENTS:
-            if abs(min_diff_cents) < 5:
-                res = f"{best_match_name}\n(OK: {min_diff_cents:+.1f} cent)"
-            elif min_diff_cents > 0:
-                res = f"{best_match_name}\n(高い: {min_diff_cents:+.1f} cent)"
-            else:
-                res = f"{best_match_name}\n(低い: {min_diff_cents:.1f} cent)"
-            return res, min_diff_cents
-        else:
-            return "一致なし", None
+            label = "OK" if abs(min_diff_cents) < 5 else ("高い" if min_diff_cents > 0 else "低い")
+            return f"{best_match_name}\n({label}: {min_diff_cents:+.1f} cent)", min_diff_cents
+        return "一致なし", None
 
     def stop_stream(self):
-        if not self._is_running:
-            return 
         self._is_running = False
-        try:
-            if self.stream:
-                self.stream.stop_stream()
-                self.stream.close()
-                self.stream = None
-            if self.pa:
-                self.pa.terminate()
-                self.pa = None
-        except Exception as e:
-            logging.error(f"ストリーム停止エラー: {e}")
+        if self.stream: self.stream.close()
+        if self.pa: self.pa.terminate()

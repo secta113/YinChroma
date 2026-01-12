@@ -1,20 +1,19 @@
-# v1.1
+# v3.0
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
 設定ファイル（config.ini）の読み書きを管理するモジュール。
+v3.0: 保存イベントのログ出力を明確化しました。
 """
 
 import configparser
 import logging
+import json
 from pathlib import Path
+from typing import Dict, List, Any
 
 class ConfigManager:
-    """
-    アプリケーションの設定を保持・更新・永続化するクラス。
-    """
-
     def __init__(self, config_file: str = "config.ini"):
         self.config_path = Path(config_file)
         self.config = configparser.ConfigParser()
@@ -22,43 +21,79 @@ class ConfigManager:
         self.load()
 
     def _load_defaults(self):
-        """デフォルト値を設定します。"""
         if "Tuner" not in self.config:
             self.config["Tuner"] = {
-                "AmplitudeThreshold": "20.5"
+                "AmplitudeThreshold": "20.5",
+                "CurrentTuning": "Standard",
+                "HeadsetMode": "True"
             }
+        
+        if "Tunings" not in self.config:
+            self.config["Tunings"] = {}
+            standard = [
+                ["1弦 (E4)", 329.63, "1弦.wav"],
+                ["2弦 (B3)", 246.94, "2弦.wav"],
+                ["3弦 (G3)", 196.00, "3弦.wav"],
+                ["4弦 (D3)", 146.83, "4弦.wav"],
+                ["5弦 (A2)", 110.00, "5弦.wav"],
+                ["6弦 (E2)", 82.41, "6弦.wav"],
+                ["7弦 (B1)", 61.74, "7弦.wav"]
+            ]
+            self.config["Tunings"]["Standard"] = json.dumps(standard, ensure_ascii=False)
 
     def load(self):
-        """ファイルから設定を読み込みます。"""
         if self.config_path.exists():
             try:
                 self.config.read(self.config_path, encoding="utf-8")
-                logging.info(f"設定ファイルを読み込みました: {self.config_path}")
             except Exception as e:
-                logging.error(f"設定ファイルの読み込みに失敗しました: {e}")
+                logging.error(f"設定ファイルの読み込み失敗: {e}")
         else:
-            logging.info("設定ファイルが見つかりません。デフォルト値を使用します。")
             self.save()
 
     def get_threshold(self) -> float:
-        """振幅閾値を取得します。"""
-        try:
-            return self.config.getfloat("Tuner", "AmplitudeThreshold", fallback=20.5)
-        except ValueError:
-            return 20.5
+        try: return self.config.getfloat("Tuner", "AmplitudeThreshold", fallback=20.5)
+        except: return 20.5
 
     def set_threshold(self, value: float):
-        """振幅閾値を更新し、ファイルに保存します。"""
-        if "Tuner" not in self.config:
-            self.config["Tuner"] = {}
         self.config["Tuner"]["AmplitudeThreshold"] = f"{value:.1f}"
         self.save()
 
+    def get_headset_mode(self) -> bool:
+        return self.config.getboolean("Tuner", "HeadsetMode", fallback=True)
+
+    def set_headset_mode(self, value: bool):
+        self.config["Tuner"]["HeadsetMode"] = str(value)
+        self.save()
+
+    def get_current_tuning_name(self) -> str:
+        return self.config.get("Tuner", "CurrentTuning", fallback="Standard")
+
+    def set_current_tuning_name(self, name: str):
+        self.config["Tuner"]["CurrentTuning"] = name
+        self.save()
+
+    def get_tuning_presets(self) -> Dict[str, List[List[Any]]]:
+        presets = {}
+        if "Tunings" in self.config:
+            for name in self.config["Tunings"]:
+                try: presets[name] = json.loads(self.config["Tunings"][name])
+                except: continue
+        return presets
+
+    def save_tuning(self, name: str, data: List[List[Any]]):
+        if "Tunings" not in self.config:
+            self.config["Tunings"] = {}
+        self.config["Tunings"][name] = json.dumps(data, ensure_ascii=False)
+        self.save()
+        logging.info(f"保存イベント: チューニング '{name}' を更新しました。")
+
     def save(self):
-        """現在の設定をファイルに書き出します。"""
+        """保存処理をログに記録します。"""
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 self.config.write(f)
-            logging.debug("設定を保存しました。")
+            # 頻繁な保存はDEBUG、重要な変更の保存はINFOが望ましいですが、
+            # ユーザーの要望により「保存が発生した部分」としてINFO出力します。
+            logging.info(f"保存成功: {self.config_path.name}")
         except Exception as e:
-            logging.error(f"設定の保存に失敗しました: {e}")
+            logging.error(f"保存失敗: {self.config_path.name} - {e}")
