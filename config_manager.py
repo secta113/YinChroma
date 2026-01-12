@@ -1,12 +1,4 @@
-# v3.0
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-設定ファイル（config.ini）の読み書きを管理するモジュール。
-v3.0: 保存イベントのログ出力を明確化しました。
-"""
-
+# v1.2
 import configparser
 import logging
 import json
@@ -14,86 +6,104 @@ from pathlib import Path
 from typing import Dict, List, Any
 
 class ConfigManager:
-    def __init__(self, config_file: str = "config.ini"):
-        self.config_path = Path(config_file)
+    """
+    config.ini ファイルの読み書きを管理するクラス。
+    セクションやキーが欠落していても初期値を返す堅牢な設計。
+    """
+    SEC_SETTINGS = "SETTINGS"
+    SEC_TUNINGS = "TUNING_PRESETS"
+
+    def __init__(self, config_path: str = "config.ini"):
+        self.config_path = Path(config_path)
         self.config = configparser.ConfigParser()
-        self._load_defaults()
-        self.load()
+        self._load_config()
 
-    def _load_defaults(self):
-        if "Tuner" not in self.config:
-            self.config["Tuner"] = {
-                "AmplitudeThreshold": "20.5",
-                "CurrentTuning": "Standard",
-                "HeadsetMode": "True"
-            }
-        
-        if "Tunings" not in self.config:
-            self.config["Tunings"] = {}
-            standard = [
-                ["1弦 (E4)", 329.63, "1弦.wav"],
-                ["2弦 (B3)", 246.94, "2弦.wav"],
-                ["3弦 (G3)", 196.00, "3弦.wav"],
-                ["4弦 (D3)", 146.83, "4弦.wav"],
-                ["5弦 (A2)", 110.00, "5弦.wav"],
-                ["6弦 (E2)", 82.41, "6弦.wav"],
-                ["7弦 (B1)", 61.74, "7弦.wav"]
-            ]
-            self.config["Tunings"]["Standard"] = json.dumps(standard, ensure_ascii=False)
-
-    def load(self):
+    def _load_config(self):
         if self.config_path.exists():
             try:
                 self.config.read(self.config_path, encoding="utf-8")
             except Exception as e:
-                logging.error(f"設定ファイルの読み込み失敗: {e}")
-        else:
-            self.save()
+                logging.error(f"Config read error: {e}")
+        
+        if not self.config.has_section(self.SEC_SETTINGS):
+            self._create_default_config()
+
+    def _create_default_config(self):
+        if not self.config.has_section(self.SEC_SETTINGS):
+            self.config.add_section(self.SEC_SETTINGS)
+        
+        self.config[self.SEC_SETTINGS] = {
+            "threshold": "2.0",
+            "yin_threshold": "0.15",
+            "headset_mode": "False",
+            "current_tuning": "Standard"
+        }
+
+        if not self.config.has_section(self.SEC_TUNINGS):
+            self.config.add_section(self.SEC_TUNINGS)
+            self.config[self.SEC_TUNINGS]["Standard"] = json.dumps([
+                ["1弦 (E4)", 329.63, ""],
+                ["2弦 (B3)", 246.94, ""],
+                ["3弦 (G3)", 196.00, ""],
+                ["4弦 (D3)", 146.83, ""],
+                ["5弦 (A2)", 110.00, ""],
+                ["6弦 (E2)", 82.41, ""]
+            ])
+        self._save_to_disk()
+
+    def _save_to_disk(self):
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                self.config.write(f)
+        except Exception as e:
+            logging.error(f"Config save error: {e}")
+
+    def _ensure_section(self, section: str):
+        if not self.config.has_section(section):
+            self.config.add_section(section)
 
     def get_threshold(self) -> float:
-        try: return self.config.getfloat("Tuner", "AmplitudeThreshold", fallback=20.5)
-        except: return 20.5
+        return self.config.getfloat(self.SEC_SETTINGS, "threshold", fallback=2.0)
 
     def set_threshold(self, value: float):
-        self.config["Tuner"]["AmplitudeThreshold"] = f"{value:.1f}"
-        self.save()
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["threshold"] = str(value)
+        self._save_to_disk()
+
+    def get_yin_threshold(self) -> float:
+        return self.config.getfloat(self.SEC_SETTINGS, "yin_threshold", fallback=0.15)
+
+    def set_yin_threshold(self, value: float):
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["yin_threshold"] = f"{value:.2f}"
+        self._save_to_disk()
 
     def get_headset_mode(self) -> bool:
-        return self.config.getboolean("Tuner", "HeadsetMode", fallback=True)
+        return self.config.getboolean(self.SEC_SETTINGS, "headset_mode", fallback=False)
 
     def set_headset_mode(self, value: bool):
-        self.config["Tuner"]["HeadsetMode"] = str(value)
-        self.save()
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["headset_mode"] = str(value)
+        self._save_to_disk()
 
     def get_current_tuning_name(self) -> str:
-        return self.config.get("Tuner", "CurrentTuning", fallback="Standard")
+        return self.config.get(self.SEC_SETTINGS, "current_tuning", fallback="Standard")
 
     def set_current_tuning_name(self, name: str):
-        self.config["Tuner"]["CurrentTuning"] = name
-        self.save()
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["current_tuning"] = name
+        self._save_to_disk()
 
     def get_tuning_presets(self) -> Dict[str, List[List[Any]]]:
         presets = {}
-        if "Tunings" in self.config:
-            for name in self.config["Tunings"]:
-                try: presets[name] = json.loads(self.config["Tunings"][name])
+        if self.config.has_section(self.SEC_TUNINGS):
+            for name, data_str in self.config.items(self.SEC_TUNINGS):
+                try:
+                    presets[name.capitalize()] = json.loads(data_str)
                 except: continue
         return presets
 
     def save_tuning(self, name: str, data: List[List[Any]]):
-        if "Tunings" not in self.config:
-            self.config["Tunings"] = {}
-        self.config["Tunings"][name] = json.dumps(data, ensure_ascii=False)
-        self.save()
-        logging.info(f"保存イベント: チューニング '{name}' を更新しました。")
-
-    def save(self):
-        """保存処理をログに記録します。"""
-        try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                self.config.write(f)
-            # 頻繁な保存はDEBUG、重要な変更の保存はINFOが望ましいですが、
-            # ユーザーの要望により「保存が発生した部分」としてINFO出力します。
-            logging.info(f"保存成功: {self.config_path.name}")
-        except Exception as e:
-            logging.error(f"保存失敗: {self.config_path.name} - {e}")
+        self._ensure_section(self.SEC_TUNINGS)
+        self.config[self.SEC_TUNINGS][name] = json.dumps(data)
+        self._save_to_disk()

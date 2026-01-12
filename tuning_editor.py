@@ -1,4 +1,4 @@
-# v3.1
+# v3.4
 import flet as ft
 import logging
 import shutil
@@ -8,6 +8,7 @@ from typing import List, Any, Callable
 class TuningEditor:
     """
     カスタムチューニングの登録・編集ダイアログを管理するクラス。
+    v3.4: ダイアログのタイトルにツール名「#YinChroma」を追加しました。
     """
     def __init__(self, page: ft.Page, sound_dir: Path, config_manager, on_save_callback: Callable):
         self.page = page
@@ -17,9 +18,9 @@ class TuningEditor:
         
         self.active_row = None
         self.upload_rows = ft.Column(spacing=5)
-        self.new_tuning_name = ft.TextField(label="チューニング名称", hint_text="例: Half Step Down")
+        self.new_tuning_name = ft.TextField(label="チューニング名称", hint_text="例: 7-String Standard")
         
-        # FilePickerの設定（親から渡されるか、ここで管理するか）
+        # FilePickerの設定
         self.file_picker = ft.FilePicker(on_result=self.on_file_result)
         self.page.overlay.append(self.file_picker)
 
@@ -28,10 +29,15 @@ class TuningEditor:
         self.upload_rows.controls.clear()
         self.new_tuning_name.value = ""
         
-        # デフォルトの6弦セットを初期表示
+        # デフォルトの7弦セットを初期表示 (v3.3修正)
         defaults = [
-            ("1弦 (E4)", "329.63"), ("2弦 (B3)", "246.94"), ("3弦 (G3)", "196.00"),
-            ("4弦 (D3)", "146.83"), ("5弦 (A2)", "110.00"), ("6弦 (E2)", "82.41")
+            ("1弦 (E4)", "329.63"), 
+            ("2弦 (B3)", "246.94"), 
+            ("3弦 (G3)", "196.00"),
+            ("4弦 (D3)", "146.83"), 
+            ("5弦 (A2)", "110.00"), 
+            ("6弦 (E2)", "82.41"),
+            ("7弦 (B1)", "61.74")
         ]
         for name, freq in defaults:
             self._add_row(name, freq)
@@ -43,7 +49,7 @@ class TuningEditor:
                 ft.Divider(),
                 ft.Row([ft.Text("構成弦リスト", size=12, color=ft.Colors.GREY_400)]),
                 self.upload_rows,
-                ft.TextButton("弦を追加", icon=ft.Icons.ADD, on_change=lambda _: self._add_row())
+                ft.TextButton("弦を追加", icon=ft.Icons.ADD, on_click=lambda _: self._add_row())
             ], scroll="always", tight=True, width=450),
             actions=[
                 ft.ElevatedButton("保存", on_click=self.save, bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
@@ -88,7 +94,10 @@ class TuningEditor:
         new_data = []
         for row in self.upload_rows.controls:
             s_name = row.controls[0].value
-            s_freq = float(row.controls[1].value or 0.0)
+            try:
+                s_freq = float(row.controls[1].value or 0.0)
+            except ValueError:
+                s_freq = 0.0
             s_file = row.data.get("file")
             
             fname = ""
@@ -99,5 +108,6 @@ class TuningEditor:
             new_data.append([s_name, s_freq, fname])
         
         self.config_manager.save_tuning(name, new_data)
+        logging.info(f"Custom tuning '{name}' saved with {len(new_data)} strings.")
         self.on_save_callback()
         self.page.close(e.control.parent)
