@@ -1,22 +1,25 @@
+# v1.4
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
 マイク入力とピッチ検出（周波数分析）を管理するモジュール。
-(★ 修正版: 音量レベルをUIに通知する機能を追加)
+v1.4: UIコールバックにセント値を渡す機能を追加しました。
 """
 
 import pyaudio
 import numpy as np
 import logging
 import math
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 class PitchDetector:
-    # ( ... チューニング定数 ... )
     RATE = 44100
     CHUNK = 2048 
+    
+    # 7弦ギター対応: B1を追加
     GUITAR_FREQUENCIES = {
+        "7弦 (B1)": 61.74,
         "6弦 (E2)": 82.41,
         "5弦 (A2)": 110.00,
         "4弦 (D3)": 146.83,
@@ -24,31 +27,23 @@ class PitchDetector:
         "2弦 (B3)": 246.94,
         "1弦 (E4)": 329.63,
     }
-    MIN_FREQ = 75.0
+    
+    # B1(61.74Hz)を検知できるよう最小周波数を引き下げ
+    MIN_FREQ = 55.0
     MAX_FREQ = 350.0
     TOLERANCE_CENTS = 50 
     YIN_THRESHOLD = 0.15
-    
-
-    # --- クラス実装 ---
 
     def __init__(self, 
-                 ui_callback: Callable[[str, float], None], # (★修正: float(音量)も受け取る定義に変更)
+                 ui_callback: Callable[[str, float, Optional[float]], None], # (★v1.4修正: centsも受け取る定義に変更)
                  threshold: float = 20.5):
-        """
-        PitchDetectorを初期化します。
-        ui_callback: (結果テキスト, 音量0.0-1.0) を受け取る関数
-        """
         self.pa: Optional[pyaudio.PyAudio] = None
         self.stream: Optional[pyaudio.Stream] = None
         self.ui_callback = ui_callback
         
-        # 閾値をインスタンス変数として保存
         self.AMPLITUDE_THRESHOLD_RMS = threshold
-        
         self._is_running = False 
 
-        # ( ... YIN関連の初期化 ... )
         self.min_period = int(self.RATE / self.MAX_FREQ)
         self.max_period = int(self.RATE / self.MIN_FREQ)
         self.yin_buffer_size = self.CHUNK * 2
@@ -56,9 +51,11 @@ class PitchDetector:
         self.diff_buffer = np.zeros(self.max_period, dtype=np.float32)
         self.cmndf_buffer = np.zeros(self.max_period, dtype=np.float32)
         
-        logging.info("PitchDetector (YIN) が初期化されました。")
-        logging.info(f"音量閾値: {self.AMPLITUDE_THRESHOLD_RMS}")
+        logging.info(f"PitchDetector v1.4 (視覚化対応) 初期化。")
 
+    def set_threshold(self, value: float):
+        self.AMPLITUDE_THRESHOLD_RMS = value
+        logging.debug(f"検出閾値を変更しました: {value}")
 
     def start_stream(self):
         if self.stream and self.stream.is_active():
@@ -78,57 +75,39 @@ class PitchDetector:
                 stream_callback=self._pyaudio_callback
             )
             self.stream.start_stream()
-            logging.info("マイクストリームを開始しました。")
-        except IOError as e:
-            self._is_running = False 
-            logging.error(f"マイクストリームの開始に失敗しました: {e}")
-            self.ui_callback("エラー: マイク不可", 0.0)
+            logging.info("マイク入力を開始しました。")
         except Exception as e:
             self._is_running = False 
-            logging.error(f"予期せぬエラー (start_stream): {e}")
-            self.ui_callback(f"エラー: {e}", 0.0)
+            logging.error(f"ストリーム開始エラー: {e}")
+            self.ui_callback("エラー: マイク不可", 0.0, None)
 
     def _pyaudio_callback(self, in_data, frame_count, time_info, status):
-        """
-        PyAudioからのコールバック
-        """
         if not self._is_running:
             return (None, pyaudio.paComplete) 
 
         try:
             data = np.frombuffer(in_data, dtype=np.int16)
-
             if data.size == 0:
                 return (in_data, pyaudio.paContinue) 
 
-            # RMS (二乗平均平方根) で音量を計算
             amplitude = np.sqrt(np.mean(data.astype(np.float64)**2))
-
-            if np.isnan(amplitude):
-                amplitude = 0.0 
-
-            # (★追加) 音量を 0.0 ～ 1.0 に正規化してUIに送る準備
-            # int16の最大値は 32768 なのでそれで割る
             normalized_volume = min(amplitude / 32768.0, 1.0)
 
+            cents = None
             if amplitude < self.AMPLITUDE_THRESHOLD_RMS:
-                # 閾値以下の場合は周波数検出しないが、音量（ノイズレベル）は送っても良い
                 freq = 0.0
             else:
                 freq = self._find_fundamental_frequency_yin(data)
             
-            result_string = self._match_frequency(freq, 1.0)
-            
-            # (★修正) コールバックに音量も渡す
-            self.ui_callback(result_string, normalized_volume)
+            result_string, cents = self._match_frequency(freq, 1.0)
+            self.ui_callback(result_string, normalized_volume, cents)
             
         except Exception as e:
-            logging.warning(f"コールバック処理中にエラー: {e}")
+            logging.warning(f"コールバック内エラー: {e}")
             
         return (in_data, pyaudio.paContinue)
 
     def _find_fundamental_frequency_yin(self, data: np.ndarray) -> float:
-        # ( ... 変更なし ... )
         self.yin_buffer = data.astype(np.float32)
         self.diff_buffer[0] = 0.0
         for tau in range(1, self.max_period):
@@ -160,43 +139,44 @@ class PitchDetector:
             tau += 1
         return 0.0
 
-    def _match_frequency(self, freq: float, amplitude: float) -> str:
-        # ( ... 変更なし ... )
+    def _match_frequency(self, freq: float, amplitude: float) -> Tuple[str, Optional[float]]:
+        """
+        周波数を解析し、表示用テキストとセント値を返します。
+        """
         if freq == 0.0:
-            return "---"
+            return "---", None
+            
         best_match_name = None
         min_diff_cents = float('inf')
+        
         for string_name, base_freq in self.GUITAR_FREQUENCIES.items():
             diff_cents = 1200 * math.log2(freq / base_freq)
             if abs(diff_cents) < abs(min_diff_cents):
                 min_diff_cents = diff_cents
                 best_match_name = string_name
+                
         if abs(min_diff_cents) <= self.TOLERANCE_CENTS:
             if abs(min_diff_cents) < 5:
-                return f"{best_match_name}\n(OK: {min_diff_cents:+.1f} cent)"
+                res = f"{best_match_name}\n(OK: {min_diff_cents:+.1f} cent)"
             elif min_diff_cents > 0:
-                return f"{best_match_name}\n(高い: {min_diff_cents:+.1f} cent)"
+                res = f"{best_match_name}\n(高い: {min_diff_cents:+.1f} cent)"
             else:
-                return f"{best_match_name}\n(低い: {min_diff_cents:.1f} cent)"
+                res = f"{best_match_name}\n(低い: {min_diff_cents:.1f} cent)"
+            return res, min_diff_cents
         else:
-            return "一致なし" 
+            return "一致なし", None
 
     def stop_stream(self):
-        # ( ... 変更なし ... )
         if not self._is_running:
             return 
         self._is_running = False
         try:
             if self.stream:
-                if self.stream.is_active():
-                    self.stream.stop_stream()
+                self.stream.stop_stream()
                 self.stream.close()
                 self.stream = None
-        except Exception:
-            pass
-        try:
             if self.pa:
                 self.pa.terminate()
                 self.pa = None
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"ストリーム停止エラー: {e}")
