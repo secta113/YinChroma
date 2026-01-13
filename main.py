@@ -14,9 +14,9 @@ except Exception:
 
 # モジュールインポート
 try:
-    from logger_manager import LoggerManager
+    from utils.logger_manager import LoggerManager
     from main_controller import MainController
-    from main_view import MainView
+    from views.main_view import MainView
 except ImportError as e:
     print(f"Critical Import Error: {e}")
     raise

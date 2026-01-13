@@ -5,10 +5,10 @@ import math
 from pathlib import Path
 from typing import List, Any, Optional
 
-from soundhandler import SoundHandler
-from pitchdetector import PitchDetector
-from config_manager import ConfigManager
-from tuning_editor import TuningEditor
+from pitchhandler.soundhandler import SoundHandler
+from pitchhandler.pitchdetector import PitchDetector
+from utils.config_manager import ConfigManager
+from views.tuning_editor import TuningEditor
 
 class MainController:
     """
