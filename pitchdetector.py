@@ -1,100 +1,145 @@
-# v3.2
+# v3.7
 import pyaudio
 import numpy as np
 import logging
 import math
 import statistics
-from typing import Callable, Optional, Tuple, Dict
+import time
+from typing import Callable, Optional, Tuple, Dict, Any
 from collections import deque
 
 class PitchDetector:
     """
     ピッチ検出ロジックを管理するクラス。
-    v3.2: 【最終安定版を目指すアーキテクチャ変更】
+    v3.7: 減衰時の誤判定対策(Decay Locking)と入力安全策(Input Clamping)を実装。
     
-    1. リングバッファ (Sliding Window): 
-       短いCHUNKごとではなく、過去のデータを連結した「長いバッファ」を解析対象とする。
-       これにより、低音弦(60Hz周辺)の周期(約16ms)を10周期以上確保し、YINの精度を物理的に高める。
+    1. Decay Locking (減衰ロック):
+       音量が減少傾向にある間（consecutive_decay_frames > 5）は、
+       周波数が大きく変わるような検知結果を「誤検知（倍音浮き上がり）」とみなして無視する。
+       これにより、サステインの後半で表示が暴れるのを防ぐ。
        
-    2. ダウンサンプリング (Decimation):
-       44.1kHz -> 約7.35kHz に間引いて解析。
-       高周波ノイズを物理的に排除し、低音の解像度を相対的に向上させる。
-       
-    3. ピッチ・ロッキング (Pitch Locking):
-       解析の「確信度(Confidence)」が低い場合は、無理に更新せず前回の値を維持する。
+    2. Averaging Downsample (平均化ダウンサンプリング):
+       単純な間引きではなく平均値をとることで、高周波ノイズ（エイリアシング）を物理的に除去する。
     """
     
     RATE = 44100
-    
-    # UI更新のためのコールバック周期 (短くて良い)
     CHUNK = 2048 
-    
-    # 解析に使う実質のバッファサイズ (長くする)
-    # 44100Hzで16384サンプル = 約0.37秒分の音を常に監視する
-    ANALYSIS_BUFFER_SIZE = 16384 
-    
-    # ダウンサンプリング係数 (6倍間引き -> 解析レート 7350Hz)
-    DECIMATION_FACTOR = 6
-    
-    MIN_FREQ = 25.0 # Low-A/G 対応
-    MAX_FREQ = 800.0 # ギターならこれ以上は不要
-    
-    TOLERANCE_CENTS = 50 
-    SMOOTHING_WINDOW = 5
 
     def __init__(self, 
                  ui_callback: Callable[[str, float, Optional[float]], None],
-                 threshold: float = 10.0):
+                 config: Optional[Dict[str, Any]] = None):
+        
         self.pa: Optional[pyaudio.PyAudio] = None
         self.stream: Optional[pyaudio.Stream] = None
         self.ui_callback = ui_callback
         
-        self.target_frequencies: Dict[str, float] = {}
+        # デフォルト設定
+        self.settings = {
+            "threshold": 10.0,
+            "yin_threshold": 0.20,
+            "latency_mode": "normal",
+            "smoothing": 5,
+            "instrument_type": "guitar"
+        }
         
-        # 閾値関連
-        self.AMPLITUDE_THRESHOLD_RMS = threshold 
-        self.yin_threshold = 0.20 # 周期性の許容誤差
-        
-        self._is_running = False 
+        if config:
+            self.settings.update(config)
 
-        # 履歴バッファ
-        self.cents_history = deque(maxlen=self.SMOOTHING_WINDOW)
-        
-        # リングバッファ（生データ保持用）
-        self.ring_buffer = np.zeros(self.ANALYSIS_BUFFER_SIZE, dtype=np.float32)
-        
-        # ロッキング機構用
+        # 状態管理変数
+        self.target_frequencies: Dict[str, float] = {}
+        self._is_running = False 
         self.last_valid_cents = 0.0
-        self.lock_counter = 0
         
-        # YIN用計算定数 (ダウンサンプリング後のレートで計算)
-        self.effective_rate = self.RATE / self.DECIMATION_FACTOR
-        self.min_period = int(self.effective_rate / self.MAX_FREQ)
-        self.max_period = int(self.effective_rate / self.MIN_FREQ)
+        # ジャンプガード & 減衰ロック用ステート
+        self.last_stable_freq = 0.0
+        self.prev_amplitude = 0.0
+        self.frames_since_attack = 0
+        self.consecutive_decay_frames = 0 # 連続して音量が下がっているフレーム数
         
-        # 解析用バッファ（間引いた後のサイズで確保）
-        decimated_size = self.ANALYSIS_BUFFER_SIZE // self.DECIMATION_FACTOR + 100
+        # 初期化
+        self._apply_settings(full_reset=True)
+        
+        logging.info(f"PitchDetector v3.7 Initialized (Decay Lock & Avg Downsample).")
+
+    def update_settings(self, new_config: Dict[str, Any]):
+        """
+        設定変更の適用。バッファサイズ変更が必要な場合のみストリームを再起動する。
+        """
+        restart_required_keys = ["latency_mode", "instrument_type", "smoothing"]
+        needs_restart = any(key in new_config for key in restart_required_keys)
+
+        self.settings.update(new_config)
+
+        if needs_restart:
+            was_running = self._is_running
+            if was_running:
+                self.stop_stream()
+            self._apply_settings(full_reset=True)
+            if was_running:
+                time.sleep(0.1) # PortAudioのリソース解放待ち
+                self.start_stream()
+        else:
+            self._apply_settings(full_reset=False)
+
+    def _apply_settings(self, full_reset: bool = False):
+        self.amplitude_threshold_rms = float(self.settings.get("threshold", 10.0))
+        self.yin_threshold = float(self.settings.get("yin_threshold", 0.20))
+        
+        if not full_reset:
+            return
+
+        # Latency Mode -> Buffer Size
+        mode = self.settings.get("latency_mode", "normal").lower()
+        if mode == "fast":
+            self.analysis_buffer_size = 8192 
+        elif mode == "stable":
+            self.analysis_buffer_size = 32768
+        else:
+            self.analysis_buffer_size = 16384
+
+        # Instrument Type -> Decimation & Range
+        instr = self.settings.get("instrument_type", "guitar").lower()
+        if instr == "bass":
+            self.decimation_factor = 10
+            self.min_freq = 20.0
+            self.max_freq = 400.0
+        else:
+            self.decimation_factor = 6
+            self.min_freq = 25.0
+            self.max_freq = 800.0
+
+        # Smoothing
+        smooth_val = max(1, min(10, int(self.settings.get("smoothing", 5))))
+        self.smoothing_window = smooth_val
+        self.cents_history = deque(maxlen=self.smoothing_window)
+
+        # Buffer Allocation
+        self.ring_buffer = np.zeros(self.analysis_buffer_size, dtype=np.float32)
+        
+        self.effective_rate = self.RATE / self.decimation_factor
+        self.min_period = int(self.effective_rate / self.max_freq)
+        self.max_period = int(self.effective_rate / self.min_freq)
+        
         self.diff_buffer = np.zeros(self.max_period, dtype=np.float32)
         self.cmndf_buffer = np.zeros(self.max_period, dtype=np.float32)
-        
-        logging.info(f"PitchDetector v3.2 Initialized.")
-        logging.info(f"Effective Analysis Rate: {self.effective_rate:.1f}Hz")
-        logging.info(f"Analysis Window: {self.ANALYSIS_BUFFER_SIZE/self.RATE:.3f} sec")
-
-    def set_threshold(self, value: float):
-        self.AMPLITUDE_THRESHOLD_RMS = value
-
-    def set_yin_threshold(self, value: float):
-        self.yin_threshold = value
 
     def set_tuning_frequencies(self, frequencies: Dict[str, float]):
         self.target_frequencies = frequencies
 
     def start_stream(self):
         if self.stream and self.stream.is_active(): return
+        
         try:
             self.pa = pyaudio.PyAudio()
             self._is_running = True 
+            
+            # ストリーム開始時に内部状態をリセット
+            self.last_stable_freq = 0.0
+            self.prev_amplitude = 0.0
+            self.frames_since_attack = 0
+            self.consecutive_decay_frames = 0
+            self.ring_buffer.fill(0)
+            
             self.stream = self.pa.open(
                 format=pyaudio.paInt16, channels=1, rate=self.RATE,
                 input=True, frames_per_buffer=self.CHUNK, 
@@ -113,77 +158,116 @@ class PitchDetector:
         return data
 
     def _pyaudio_callback(self, in_data, frame_count, time_info, status):
-        """
-        ここでの処理:
-        1. 入ってきた短い音声(CHUNK)をリングバッファに追加
-        2. リングバッファ全体を使って解析（ダウンサンプリング -> YIN）
-        """
         if not self._is_running: return (None, pyaudio.paComplete) 
         try:
-            # 1. データの取り込み
-            new_data = np.frombuffer(in_data, dtype=np.int16).astype(np.float32)
+            # int16として読み込み (将来的なクリッピング処理のため)
+            raw_ints = np.frombuffer(in_data, dtype=np.int16)
+            new_data = raw_ints.astype(np.float32)
             
-            # リングバッファをシフトして新しいデータを末尾に追加 (np.rollより高速なスライス操作)
+            # リングバッファ更新
             self.ring_buffer[:-self.CHUNK] = self.ring_buffer[self.CHUNK:]
             self.ring_buffer[-self.CHUNK:] = new_data
             
-            # --- 解析フェーズ ---
-            
-            # 最新のCHUNK部分の音量で「入力があるか」を判定
             amplitude = np.sqrt(np.mean(new_data**2))
             display_volume = min((amplitude / 1000.0), 1.0) 
+            threshold_val = max(self.amplitude_threshold_rms, 1.0) * 10.0
             
-            threshold_val = max(self.AMPLITUDE_THRESHOLD_RMS, 1.0) * 10.0
+            # --- アタック & 減衰(Decay)判定 ---
+            is_attack = False
             
+            # 音量が前回より1.2倍以上増えたらアタックとみなす
+            if amplitude > self.prev_amplitude * 1.2:
+                if amplitude > threshold_val:
+                    is_attack = True
+                    self.frames_since_attack = 0
+                    self.consecutive_decay_frames = 0
+            # 音量が前回より減ったら減衰カウンターを増やす
+            elif amplitude < self.prev_amplitude:
+                self.consecutive_decay_frames += 1
+            else:
+                # 変化なし、または微増（ノイズ揺らぎ）の場合は減衰カウントを維持かリセットするか
+                # ここでは微増は維持扱いにする
+                pass
+            
+            if not is_attack:
+                self.frames_since_attack += 1
+            
+            self.prev_amplitude = amplitude
+            # ----------------------------------
+
             final_cents = None
             
+            # 音量が小さすぎる場合はリセット
             if amplitude < threshold_val:
-                # 音が小さい時はリセット
                 freq = 0.0
                 display_volume = 0.0
                 self.cents_history.clear()
                 self.last_valid_cents = 0.0
+                self.last_stable_freq = 0.0 
             else:
-                # 2. ダウンサンプリング (間引き)
-                # リングバッファ全体（0.37秒分）を間引いて取得
-                # これにより LPF効果 + 計算量削減 + 低音解像度向上 を同時に達成
-                decimated_data = self.ring_buffer[::self.DECIMATION_FACTOR]
+                # 1. 平均化ダウンサンプリング (Averaging)
+                # 高周波ノイズ（スパイク）をなまらせる効果がある
+                limit = len(self.ring_buffer) - (len(self.ring_buffer) % self.decimation_factor)
+                reshaped = self.ring_buffer[:limit].reshape(-1, self.decimation_factor)
+                decimated_data = np.mean(reshaped, axis=1) 
                 
                 # DCカット & 正規化
                 decimated_data -= np.mean(decimated_data)
                 normalized_data = self._normalize_signal(decimated_data)
                 
-                # 3. YIN解析 (間引いたデータを使用)
+                # 2. YIN解析
                 freq, confidence = self._find_fundamental_frequency_yin(normalized_data)
                 
-                # 4. ピッチ・ロッキング (信頼度判定)
-                if confidence < self.yin_threshold: 
-                    # 信頼度が高い(値が小さい)場合のみ採用
-                    pass
+                # 3. Decay Lock (減衰ロック) & Jump Guard
+                # ロジック:
+                # - アタック時: どんな周波数でも信頼度が高ければ受け入れる
+                # - 減衰時(Decay): 周波数の変更を厳しく制限する
+                
+                if self.last_stable_freq > 0:
+                    ratio = freq / self.last_stable_freq
+                    # 半音以内のズレかどうか (0.94 < ratio < 1.06)
+                    is_same_note = 0.94 < ratio < 1.06
+                    
+                    if is_attack:
+                         # アタック時は新しい音を弾いた可能性が高いので更新許可
+                         if confidence < self.yin_threshold:
+                             self.last_stable_freq = freq
+                    elif self.consecutive_decay_frames > 5:
+                        # 完全に減衰モードに入っている場合
+                        if is_same_note:
+                             # 同じ音程内なら更新（チョーキング等の追従のため）
+                             if confidence < self.yin_threshold:
+                                 self.last_stable_freq = freq
+                        else:
+                             # 違う音程（倍音ジャンプなど）は無視して、前回の安定値を強制使用
+                             freq = self.last_stable_freq
+                    else:
+                        # サステイン安定期 (アタック直後〜減衰開始前)
+                        if confidence < self.yin_threshold:
+                             # 信頼度が高ければ遷移を許可するが、できれば滑らかに
+                             if is_same_note or confidence < 0.1:
+                                 self.last_stable_freq = freq
+                             else:
+                                 freq = self.last_stable_freq
                 else:
-                    # 信頼度が低い場合は、前回値を維持する (Hysteresis)
-                    if self.last_valid_cents != 0.0:
-                        # 周波数を前回のcentsから逆算するのは面倒なので、
-                        # ここでは周波数更新をスキップする扱いにする
-                        freq = 0.0 
-            
-            # 結果のマッチング
+                    # 初回検出 (何も保持していない時)
+                    if confidence < self.yin_threshold:
+                        self.last_stable_freq = freq
+
             if freq > 0:
                 result_string, raw_cents = self._match_frequency(freq)
                 if raw_cents is not None:
                     self.cents_history.append(raw_cents)
                     final_cents = statistics.median(self.cents_history)
-                    self.last_valid_cents = final_cents # ロック用に保存
+                    self.last_valid_cents = final_cents
                 else:
                     final_cents = self.last_valid_cents if self.last_valid_cents != 0 else None
             else:
-                # 解析失敗または信頼度不足のとき、直前の値を表示し続ける（チラつき防止）
+                # 音はあるが解析失敗、またはロックにより前回値を維持する場合
                 if self.last_valid_cents != 0 and amplitude > threshold_val:
                      final_cents = self.last_valid_cents
-                     result_string = "Holding..." # デバッグ用表示(通常は前の表示維持でも可)
-                     # 実際にはUIコールバック側で処理されるため、ここではNoneを返さず値を返す
-                     # ただし match_frequency を呼んでないので文字列生成が必要
-                     result_string, _ = self._match_frequency(440.0 * (2**(self.last_valid_cents/1200))) # 近似
+                     # 保持中の表示更新（"Hold"等の表示に変えても良いが、自然に見せるため値を維持）
+                     result_string, _ = self._match_frequency(440.0 * (2**(self.last_valid_cents/1200)))
                 else:
                     final_cents = None
                     result_string = "---"
@@ -198,24 +282,20 @@ class PitchDetector:
         return (in_data, pyaudio.paContinue)
 
     def _find_fundamental_frequency_yin(self, data: np.ndarray) -> Tuple[float, float]:
-        """
-        YINアルゴリズム (戻り値に confidence を追加)
-        """
         yin_buffer = data
         half_chunk = len(data) // 2
         
-        # 安全策: バッファサイズチェック
         if len(data) < self.max_period + half_chunk:
              return 0.0, 1.0
 
         self.diff_buffer.fill(0.0)
         
-        # 1. 差分関数 (Difference Function)
+        # Difference Function
         for tau in range(1, self.max_period):
             diff = yin_buffer[:half_chunk] - yin_buffer[tau : tau + half_chunk]
             self.diff_buffer[tau] = np.sum(diff**2)
             
-        # 2. CMNDF
+        # CMNDF
         self.cmndf_buffer[0] = 1.0
         running_sum = 0.0
         for tau in range(1, self.max_period):
@@ -225,11 +305,10 @@ class PitchDetector:
             else:
                 self.cmndf_buffer[tau] = (self.diff_buffer[tau] * tau) / running_sum
         
-        # 3. 絶対閾値探索
         tau = self.min_period
         best_tau = 0
         found = False
-        min_val = 1.0 # 最小のCMNDF値 (これが小さいほど信頼度が高い)
+        min_val = 1.0 
         
         while tau < self.max_period:
             val = self.cmndf_buffer[tau]
@@ -244,9 +323,8 @@ class PitchDetector:
             tau += 1
             
         if not found:
-            return 0.0, 1.0 # 検出なし, 信頼度最悪
+            return 0.0, 1.0
 
-        # 4. 放物線補間
         period = float(best_tau)
         if 0 < best_tau < self.max_period - 1:
             y1 = self.cmndf_buffer[best_tau - 1]
@@ -258,7 +336,7 @@ class PitchDetector:
                 period += period_offset
         
         freq = self.effective_rate / period
-        confidence = min_val # YINの谷の深さを信頼度とする(0に近いほど完璧な周期)
+        confidence = min_val 
         
         return freq, confidence
 
@@ -266,8 +344,7 @@ class PitchDetector:
         if freq == 0.0: return "---", None
         best_match_name, min_diff_cents = None, float('inf')
         
-        # 範囲外チェック
-        if freq < self.MIN_FREQ or freq > self.MAX_FREQ:
+        if freq < self.min_freq or freq > self.max_freq:
             return "---", None
 
         for name, base_freq in self.target_frequencies.items():
@@ -280,7 +357,7 @@ class PitchDetector:
         
         if best_match_name is None: return "---", None
 
-        if abs(min_diff_cents) <= self.TOLERANCE_CENTS:
+        if abs(min_diff_cents) <= 50:
             label = "OK" if abs(min_diff_cents) < 5 else ("高い" if min_diff_cents > 0 else "低い")
             return f"{best_match_name}\n({label}: {min_diff_cents:+.1f})", min_diff_cents
         
@@ -294,5 +371,9 @@ class PitchDetector:
                 self.stream.stop_stream()
                 self.stream.close()
             except: pass
+            self.stream = None 
         if self.pa:
-            self.pa.terminate()
+            try:
+                self.pa.terminate()
+            except: pass
+            self.pa = None

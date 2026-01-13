@@ -38,9 +38,9 @@ def main(page: ft.Page):
     logging.info("--- main() 関数を開始しました ---")
     
     # ウィンドウサイズの設定
-    page.window.width = 450
+    page.window.width = 800
     page.window.height = 800
-    page.window.min_width = 400
+    page.window.min_width = 800
     page.window.min_height = 700
 
     # Controllerの初期化
