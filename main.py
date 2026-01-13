@@ -41,7 +41,7 @@ def main(page: ft.Page):
     page.window.width = 800
     page.window.height = 800
     page.window.min_width = 800
-    page.window.min_height = 700
+    page.window.min_height = 800
 
     # Controllerの初期化
     controller = MainController(page, SOUND_DIR)

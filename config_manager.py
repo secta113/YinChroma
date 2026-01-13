@@ -1,4 +1,4 @@
-# v1.3
+# v1.6
 import configparser
 import logging
 import json
@@ -8,7 +8,8 @@ from typing import Dict, List, Any
 class ConfigManager:
     """
     config.ini ファイルの読み書きを管理するクラス。
-    v1.3: PitchDetector v3.3対応（レイテンシ、スムージング、楽器タイプ）の設定項目を追加。
+    v1.5: PitchDetector v3.14対応（最近傍マッチング許容範囲）。
+    v1.6: High Quality Mode (44.1kHz Full Analysis) 設定を追加。
     """
     SEC_SETTINGS = "SETTINGS"
     SEC_TUNINGS = "TUNING_PRESETS"
@@ -32,15 +33,18 @@ class ConfigManager:
         if not self.config.has_section(self.SEC_SETTINGS):
             self.config.add_section(self.SEC_SETTINGS)
         
-        # v3.3対応のデフォルト値
         self.config[self.SEC_SETTINGS] = {
             "threshold": "2.0",
             "yin_threshold": "0.20",
             "headset_mode": "False",
+            "high_quality_mode": "False", # v1.6 default
             "current_tuning": "Standard",
             "latency_mode": "normal",
             "smoothing": "5",
-            "instrument_type": "guitar"
+            "instrument_type": "guitar",
+            "subharmonic_confidence_ratio": "0.90",
+            "octave_lookback_ratio": "0.80",
+            "nearest_note_window": "300.0" 
         }
 
         if not self.config.has_section(self.SEC_TUNINGS):
@@ -90,6 +94,15 @@ class ConfigManager:
         self._ensure_section(self.SEC_SETTINGS)
         self.config[self.SEC_SETTINGS]["headset_mode"] = str(value)
         self._save_to_disk()
+    
+    # v1.6 High Quality Mode
+    def get_high_quality_mode(self) -> bool:
+        return self.config.getboolean(self.SEC_SETTINGS, "high_quality_mode", fallback=False)
+
+    def set_high_quality_mode(self, value: bool):
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["high_quality_mode"] = str(value)
+        self._save_to_disk()
 
     def get_current_tuning_name(self) -> str:
         return self.config.get(self.SEC_SETTINGS, "current_tuning", fallback="Standard")
@@ -99,7 +112,7 @@ class ConfigManager:
         self.config[self.SEC_SETTINGS]["current_tuning"] = name
         self._save_to_disk()
 
-    # --- Advanced Settings (v1.3) ---
+    # --- Advanced Settings ---
     def get_latency_mode(self) -> str:
         return self.config.get(self.SEC_SETTINGS, "latency_mode", fallback="normal")
 
@@ -124,6 +137,31 @@ class ConfigManager:
         self.config[self.SEC_SETTINGS]["instrument_type"] = value
         self._save_to_disk()
 
+    # --- Logic Tunings ---
+    def get_subharmonic_confidence_ratio(self) -> float:
+        return self.config.getfloat(self.SEC_SETTINGS, "subharmonic_confidence_ratio", fallback=0.90)
+
+    def set_subharmonic_confidence_ratio(self, value: float):
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["subharmonic_confidence_ratio"] = f"{value:.2f}"
+        self._save_to_disk()
+
+    def get_octave_lookback_ratio(self) -> float:
+        return self.config.getfloat(self.SEC_SETTINGS, "octave_lookback_ratio", fallback=0.80)
+
+    def set_octave_lookback_ratio(self, value: float):
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["octave_lookback_ratio"] = f"{value:.2f}"
+        self._save_to_disk()
+
+    def get_nearest_note_window(self) -> float:
+        return self.config.getfloat(self.SEC_SETTINGS, "nearest_note_window", fallback=300.0)
+
+    def set_nearest_note_window(self, value: float):
+        self._ensure_section(self.SEC_SETTINGS)
+        self.config[self.SEC_SETTINGS]["nearest_note_window"] = f"{value:.1f}"
+        self._save_to_disk()
+
     # --- Tuning Presets ---
     def get_tuning_presets(self) -> Dict[str, List[List[Any]]]:
         presets = {}
@@ -144,7 +182,11 @@ class ConfigManager:
         return {
             "threshold": self.get_threshold(),
             "yin_threshold": self.get_yin_threshold(),
+            "high_quality": self.get_high_quality_mode(), # PitchDetector側キー名と合わせる
             "latency_mode": self.get_latency_mode(),
             "smoothing": self.get_smoothing(),
-            "instrument_type": self.get_instrument_type()
+            "instrument_type": self.get_instrument_type(),
+            "subharmonic_confidence_ratio": self.get_subharmonic_confidence_ratio(),
+            "octave_lookback_ratio": self.get_octave_lookback_ratio(),
+            "nearest_note_window": self.get_nearest_note_window()
         }

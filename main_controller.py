@@ -1,4 +1,4 @@
-# v5.9
+# v7.0
 import logging
 import flet as ft
 import math
@@ -13,10 +13,9 @@ from tuning_editor import TuningEditor
 class MainController:
     """
     アプリのロジック、イベント処理、状態管理を担当するクラス。
-    v5.9: 入力感度(Sensitivity)と閾値(Threshold)の関係を修正。
-          - スライダー(感度)を上げる(右) -> 閾値を下げる(高感度)
-          - スライダーを下げる(左) -> 閾値を上げる(低感度)
-          - これによりユーザーの直感と一致させる。
+    v6.4: 高精度モード対応。
+    v7.0: SettingsView分離に伴い、UIコンポーネントへの参照パスを修正。
+          (例: self.view.threshold_slider -> self.view.settings_view.threshold_slider)
     """
     def __init__(self, page: ft.Page, sound_dir: Path):
         self.page = page
@@ -51,37 +50,53 @@ class MainController:
     def _initialize_ui_values(self):
         """設定値に基づいてUIコンポーネントの初期状態を設定"""
         if not self.view: return
+        
+        # Settings Viewへのショートカット
+        sv = self.view.settings_view
 
-        # Threshold Slider (Inverted & Non-linear mapping)
-        # 保存されているのは「閾値(0-100)」
-        # UIで表示したいのは「感度(0-100)」
-        # 関係: Threshold = ((100 - Sensitivity) / 100)^2 * 100
-        # 逆算: Sensitivity = 100 * (1 - sqrt(Threshold / 100))
+        # Threshold
         saved_thresh = self.config_manager.get_threshold()
-        
-        # 安全策: ルート計算の前に負の値を防ぐ
         safe_thresh = max(0.0, saved_thresh)
-        
         slider_pos = 100.0 * (1.0 - math.sqrt(safe_thresh / 100.0))
-        # 0-100の範囲に収める
         slider_pos = max(0.0, min(100.0, slider_pos))
         
-        self.view.threshold_slider.value = slider_pos
-        self.view.threshold_value_text.value = f"入力感度: {slider_pos:.0f}%"
+        sv.threshold_slider.value = slider_pos
+        sv.threshold_value_text.value = f"入力感度: {slider_pos:.0f}%"
 
         # YIN Threshold
-        self.view.yin_slider.value = self.config_manager.get_yin_threshold()
-        self.view.yin_value_text.value = f"検出感度: {self.view.yin_slider.value:.2f}"
+        sv.yin_slider.value = self.config_manager.get_yin_threshold()
+        sv.yin_value_text.value = f"検出信頼度(YIN): {sv.yin_slider.value:.2f}"
+        
+        # HQ Mode
+        sv.hq_switch.value = self.config_manager.get_high_quality_mode()
+        
+        # Headset Mode
+        sv.mode_switch.value = self.config_manager.get_headset_mode()
+
+        # Sub-harmonic Ratio
+        sub_ratio = self.config_manager.get_subharmonic_confidence_ratio()
+        sv.subharmonic_slider.value = sub_ratio
+        sv.subharmonic_text.value = f"倍音抑制: {sub_ratio:.2f}"
+
+        # Octave Lookback Ratio
+        oct_ratio = self.config_manager.get_octave_lookback_ratio()
+        sv.octave_lookback_slider.value = oct_ratio
+        sv.octave_lookback_text.value = f"低音補正(オクターブ): {oct_ratio:.2f}"
+
+        # Nearest Note Window
+        window_val = self.config_manager.get_nearest_note_window()
+        sv.window_slider.value = window_val
+        sv.window_text.value = f"許容誤差範囲(Window): {window_val:.0f}"
 
         # Latency Mode
-        self.view.latency_dropdown.value = self.config_manager.get_latency_mode()
+        sv.latency_dropdown.value = self.config_manager.get_latency_mode()
         
         # Instrument Type
-        self.view.instrument_group.value = self.config_manager.get_instrument_type()
+        sv.instrument_group.value = self.config_manager.get_instrument_type()
 
         # Smoothing
-        self.view.smoothing_slider.value = float(self.config_manager.get_smoothing())
-        self.view.smoothing_text.value = f"針の滑らかさ: {int(self.view.smoothing_slider.value)}"
+        sv.smoothing_slider.value = float(self.config_manager.get_smoothing())
+        sv.smoothing_text.value = f"表示の安定度: {int(sv.smoothing_slider.value)}"
 
     def _load_tuning_presets(self):
         presets = self.config_manager.get_tuning_presets()
@@ -130,13 +145,11 @@ class MainController:
     # --- Setting Handlers ---
 
     def on_threshold_change(self, e):
-        # UI: Sensitivity (0-100%)
-        # Logic: Threshold (High Sensitivity -> Low Threshold)
+        # SettingsView経由で参照
+        sv = self.view.settings_view
         sensitivity = e.control.value
-        self.view.threshold_value_text.value = f"入力感度: {sensitivity:.0f}%"
+        sv.threshold_value_text.value = f"入力感度: {sensitivity:.0f}%"
         
-        # 反転マッピング: 感度が高い(100)ほど、閾値は小さく(0)なる
-        # 感度が高い領域(右側)での微調整を効かせるため、0付近で細かくなる2乗カーブを使用
         inverted_val = 100.0 - sensitivity
         mapped_threshold = (inverted_val / 100.0) ** 2 * 100.0
         
@@ -150,13 +163,50 @@ class MainController:
         self.config_manager.set_threshold(mapped_threshold)
 
     def on_yin_change(self, e):
+        sv = self.view.settings_view
         val = float(e.control.value)
-        self.view.yin_value_text.value = f"検出感度: {val:.2f}"
+        sv.yin_value_text.value = f"検出信頼度(YIN): {val:.2f}"
         self.pitch_detector.update_settings({"yin_threshold": val})
         self.page.update()
 
     def on_yin_change_end(self, e):
-        self.config_manager.set_yin_threshold(e.control.value)
+        self.config_manager.set_yin_threshold(float(e.control.value))
+
+    def on_high_quality_change(self, e):
+        val = e.control.value
+        self.config_manager.set_high_quality_mode(val)
+        self.pitch_detector.update_settings({"high_quality": val})
+        self.page.update()
+
+    def on_subharmonic_change(self, e):
+        sv = self.view.settings_view
+        val = float(e.control.value)
+        sv.subharmonic_text.value = f"倍音抑制: {val:.2f}"
+        self.pitch_detector.update_settings({"subharmonic_confidence_ratio": val})
+        self.page.update()
+
+    def on_subharmonic_change_end(self, e):
+        self.config_manager.set_subharmonic_confidence_ratio(float(e.control.value))
+
+    def on_octave_lookback_change(self, e):
+        sv = self.view.settings_view
+        val = float(e.control.value)
+        sv.octave_lookback_text.value = f"低音補正(オクターブ): {val:.2f}"
+        self.pitch_detector.update_settings({"octave_lookback_ratio": val})
+        self.page.update()
+
+    def on_octave_lookback_change_end(self, e):
+        self.config_manager.set_octave_lookback_ratio(float(e.control.value))
+
+    def on_window_change(self, e):
+        sv = self.view.settings_view
+        val = float(e.control.value)
+        sv.window_text.value = f"許容誤差範囲(Window): {val:.0f}"
+        self.pitch_detector.update_settings({"nearest_note_window": val})
+        self.page.update()
+
+    def on_window_change_end(self, e):
+        self.config_manager.set_nearest_note_window(float(e.control.value))
 
     def on_latency_change(self, e):
         val = e.control.value
@@ -171,8 +221,9 @@ class MainController:
         self.page.update()
 
     def on_smoothing_change(self, e):
+        sv = self.view.settings_view
         val = int(e.control.value)
-        self.view.smoothing_text.value = f"針の滑らかさ: {val}"
+        sv.smoothing_text.value = f"表示の安定度: {val}"
         self.pitch_detector.update_settings({"smoothing": val})
         self.page.update()
 
@@ -188,7 +239,9 @@ class MainController:
     def play_sound_click(self, e):
         path = e.control.data
         if not path or not path.exists(): return
-        if not self.view.mode_switch.value:
+        
+        # ヘッドセットモードの状態確認もSettingsView経由
+        if not self.view.settings_view.mode_switch.value:
             self.view.result_text.value = "再生中..."
             self.view.result_text.color = ft.Colors.ORANGE_300
             self.view.meter_needle.left = (55 * self.view.unit_to_px) - 2
@@ -218,10 +271,17 @@ class MainController:
         self.page.update()
 
     def _update_ui_callback(self, result_text: str, volume: float, cents: Optional[float]):
+        """
+        PitchDetectorのAnalysisスレッドから呼び出されるコールバック。
+        """
         if self.is_closing or not self.view: return
         self._callback_count += 1
         
-        if not self.view.mode_switch.value and self.sound_handler.is_playing: return
+        if self._callback_count % 5 != 0:
+            return
+
+        # SettingsView経由でHeadset Modeのチェック
+        if not self.view.settings_view.mode_switch.value and self.sound_handler.is_playing: return
         
         self.view.volume_bar.value = volume
         
@@ -243,8 +303,10 @@ class MainController:
             self.view.meter_needle.left = (55 * self.view.unit_to_px) - 2
             self.view.meter_needle.bgcolor = ft.Colors.ORANGE_400
             
-        if self._callback_count % 5 == 0:
+        try:
             self.page.update()
+        except Exception:
+            pass
 
     def cleanup(self):
         self.is_closing = True
